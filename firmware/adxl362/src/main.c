@@ -42,16 +42,75 @@ static struct gpio_callback button_cb_data;
 #define FLAGS	0
 #endif
 
+#define TIMER_INTERVAL_MSEC 60
+
 K_SEM_DEFINE(sem, 0, 1);
+
+struct k_timer data_sampling_timer;
 
 bool collect_data_flag;
 int count;
+
+const struct device *dev;
+struct sensor_value accel[3];
+
+const struct device *leddev;
+
+
+/*
+	Sample the IMU
+	@returns 0 if okay, otherwise returns 1
+
+*/
+
+static int imu_sample(void) {
+
+	if (sensor_channel_get(dev, SENSOR_CHAN_ACCEL_X, &accel[0]) < 0) {
+		printf("Channel get error\n");
+		return 1;
+	}
+
+	if (sensor_channel_get(dev, SENSOR_CHAN_ACCEL_Y, &accel[1]) < 0) {
+		printf("Channel get error\n");
+		return 1;
+	}
+
+	if (sensor_channel_get(dev, SENSOR_CHAN_ACCEL_Z, &accel[2]) < 0) {
+		printf("Channel get error\n");
+		return 1;
+	}
+
+	printf("x: %.1f, y: %.1f, z: %.1f (m/s^2)\n",
+		sensor_value_to_double(&accel[0]),
+		sensor_value_to_double(&accel[1]),
+		sensor_value_to_double(&accel[2]));
+		count++;
+		gpio_pin_set(leddev, PIN, true);
+
+	return 0;
+
+}
+
+void imu_sample_event(struct k_timer *timer_id){
+    int err = imu_sample();
+    if (err) {
+        printk("Error in adc sampling: %d\n", err);
+    }
+}
+
+/*
+	Interrput handler for the button
+*/
 
 void button_pressed(const struct device *dev, struct gpio_callback *cb,
 		    uint32_t pins)
 {
 	collect_data_flag = true;
 	count = 0;
+
+	// start timer for data sampling
+	k_timer_start(&data_sampling_timer, K_MSEC(TIMER_INTERVAL_MSEC), K_MSEC(TIMER_INTERVAL_MSEC));
+
 	// printk("Button pressed at %" PRIu32 "\n", k_cycle_get_32());
 
 }
@@ -77,12 +136,14 @@ static void trigger_handler(const struct device *dev,
 
 void main(void)
 {
-	struct sensor_value accel[3];
+	// start a timer to sample the imu at a set interval
+	k_timer_init(&data_sampling_timer, imu_sample_event, NULL);
+	
 
-
+	// set up LED
 	int ret;
 	bool led_on = true;
-	const struct device *leddev;
+	
 	leddev = device_get_binding(LED0);
 	if (leddev==NULL) {
 		printk("No device found!");
@@ -100,6 +161,7 @@ void main(void)
 	collect_data_flag = false;
 	count = 0;
 
+	// set up Buttons
 	
 	if (!device_is_ready(button.port)) {
 		printk("Error: button device %s is not ready\n",
@@ -126,10 +188,9 @@ void main(void)
 	gpio_add_callback(button.port, &button_cb_data);
 
 
-	
-	
+	// set up IMU
 
-	const struct device *dev = device_get_binding(DT_LABEL(DT_INST(0, adi_adxl362)));
+	dev = device_get_binding(DT_LABEL(DT_INST(0, adi_adxl362)));
 	if (dev == NULL) {
 		printf("Device get binding device\n");
 		return;
@@ -170,33 +231,17 @@ void main(void)
 			
 		}
 
+		// if the collect_data_flag has been set and 
+
 		if (collect_data_flag && count < 300 ) {
-
-			if (sensor_channel_get(dev, SENSOR_CHAN_ACCEL_X, &accel[0]) < 0) {
-				printf("Channel get error\n");
-				return;
-			}
-
-			if (sensor_channel_get(dev, SENSOR_CHAN_ACCEL_Y, &accel[1]) < 0) {
-				printf("Channel get error\n");
-				return;
-			}
-
-			if (sensor_channel_get(dev, SENSOR_CHAN_ACCEL_Z, &accel[2]) < 0) {
-				printf("Channel get error\n");
-				return;
-			}
-
-			printf("x: %.1f, y: %.1f, z: %.1f (m/s^2)\n",
-				sensor_value_to_double(&accel[0]),
-				sensor_value_to_double(&accel[1]),
-				sensor_value_to_double(&accel[2]));
-				count++;
-				gpio_pin_set(leddev, PIN, true);
+			// continue to collect data
+			gpio_pin_set(leddev, PIN, true);
 		}
 		else if (collect_data_flag && (count >= 300) ) {
-				collect_data_flag = false;
-				gpio_pin_set(leddev, PIN, false);
+			// stop the periodic timer
+			k_timer_stop(&data_sampling_timer);
+			collect_data_flag = false;
+			gpio_pin_set(leddev, PIN, false);
 		}
 			
 	}

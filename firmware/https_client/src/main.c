@@ -222,7 +222,7 @@ void main(void)
 	if (err) {
 		goto clean_up;
 	}
-	printk("%s",send_buf);
+	printk("Sending: \r\n %s \r\n",send_buf);
 
 	printk("Connecting to %s\n", HTTPS_HOSTNAME);
 	err = connect(fd, res->ai_addr, sizeof(struct sockaddr_in));

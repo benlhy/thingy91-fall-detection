@@ -6,6 +6,12 @@ This is the project for the fall detection using the Thingy:91. The Thingy:91 is
 
 1. https://github.com/nrfconnect/sdk-nrf/tree/main/samples
 
+
+# Process
+1. Build the project
+2. Load the file into nRF Connect Programmer
+3. Set the board in reset mode by holding down the Multi button and turning the device on while connected to the computer
+4. Flash the device using MCUBoot
 # Block Diagram
 
 # BOM

@@ -42,7 +42,23 @@ static struct gpio_callback button_cb_data;
 #define FLAGS	0
 #endif
 
+/* The devicetree node identifier for the nodelabel in the dts file. */
+#define LED1_NODE DT_ALIAS(led1)
+
+#if DT_NODE_HAS_STATUS(LED1_NODE, okay)
+#define LED0	DT_GPIO_LABEL(LED1_NODE, gpios)
+#define PIN		DT_GPIO_PIN(LED1_NODE, gpios)
+#define FLAGS	DT_GPIO_FLAGS(LED1_NODE, gpios)
+#else
+/* A build error here means your board isn't set up to blink an LED. */
+#error "Unsupported board: led0 devicetree alias is not defined"
+#define LED0	""
+#define PIN	0
+#define FLAGS	0
+#endif
+
 #define TIMER_INTERVAL_MSEC 60
+#define TOTAL_DATA_POINTS 3000
 
 K_SEM_DEFINE(sem, 0, 1);
 
@@ -54,8 +70,8 @@ int count;
 const struct device *dev;
 struct sensor_value accel[3];
 
-const struct device *leddev;
-
+const struct device *ledred;
+const struct device *ledgreen;
 
 /*
 	Sample the IMU
@@ -85,7 +101,7 @@ static int imu_sample(void) {
 		sensor_value_to_double(&accel[1]),
 		sensor_value_to_double(&accel[2]));
 		count++;
-		gpio_pin_set(leddev, PIN, true);
+		gpio_pin_set(ledred, PIN, true);
 
 	return 0;
 
@@ -105,8 +121,8 @@ void imu_sample_event(struct k_timer *timer_id){
 void button_pressed(const struct device *dev, struct gpio_callback *cb,
 		    uint32_t pins)
 {
-	collect_data_flag = true;
-	count = 0;
+	collect_data_flag = true;	// set flag to collect data
+	count = 0; 					// reset count
 
 	// start timer for data sampling
 	k_timer_start(&data_sampling_timer, K_MSEC(TIMER_INTERVAL_MSEC), K_MSEC(TIMER_INTERVAL_MSEC));
@@ -129,6 +145,9 @@ static void trigger_handler(const struct device *dev,
 	case SENSOR_TRIG_THRESHOLD:
 		printf("Threshold trigger\n");
 		break;
+	case SENSOR_TRIG_FREEFALL:
+		printf("Freefall trigger\n");
+		break;
 	default:
 		printf("Unknown trigger\n");
 	}
@@ -144,22 +163,35 @@ void main(void)
 	int ret;
 	bool led_on = true;
 	
-	leddev = device_get_binding(LED0);
-	if (leddev==NULL) {
+	ledred = device_get_binding(LED0);
+	if (ledred==NULL) {
 		printk("No device found!");
 		return;
 	}
-	ret = gpio_pin_configure(leddev,PIN, GPIO_OUTPUT_ACTIVE | FLAGS);
+	ret = gpio_pin_configure(ledred,PIN, GPIO_OUTPUT_ACTIVE | FLAGS);
+
+	if (ret<0 ){
+		return;
+	}
+	// gpio_pin_set(ledred, PIN, true);
+
+	ledgreen = device_get_binding(LED0);
+	if (ledgreen==NULL) {
+		printk("No device found!");
+		return;
+	}
+	ret = gpio_pin_configure(ledgreen,PIN, GPIO_OUTPUT_ACTIVE | FLAGS);
 
 	if (ret<0 ){
 		return;
 	}
 
-	gpio_pin_set(leddev, PIN, true);
+	gpio_pin_set(ledgreen, PIN, true);
+
 
 	
 	collect_data_flag = false;
-	count = 0;
+	count = 0; // reset count
 
 	// set up Buttons
 	
@@ -209,12 +241,15 @@ void main(void)
 		if (sensor_trigger_set(dev, &trig, trigger_handler)) {
 			printf("Trigger set error\n");
 		}
+
+		trig.type = SENSOR_TRIG_FREEFALL;
+		if (sensor_trigger_set(dev, &trig, trigger_handler)) {
+			printf("Trigger set error\n");
+		}
 	}
 
-	gpio_pin_set(leddev, PIN, false);
-
-
-	
+	gpio_pin_set(ledgreen, PIN, false);	// setup complete
+	k_sleep(K_MSEC(1000));
 
 	while (true) {
 		if (IS_ENABLED(CONFIG_ADXL362_TRIGGER)) {
@@ -225,23 +260,20 @@ void main(void)
 			if (sensor_sample_fetch(dev) < 0) {
 				printf("Sample fetch error\n");
 				return;
-			}
-			
-				
-			
+			}	
 		}
 
 		// if the collect_data_flag has been set and 
 
-		if (collect_data_flag && count < 300 ) {
+		if (collect_data_flag && count < TOTAL_DATA_POINTS ) {
 			// continue to collect data
-			gpio_pin_set(leddev, PIN, true);
+			gpio_pin_set(ledred, PIN, true);
 		}
-		else if (collect_data_flag && (count >= 300) ) {
+		else if (collect_data_flag && (count >= TOTAL_DATA_POINTS) ) {
 			// stop the periodic timer
 			k_timer_stop(&data_sampling_timer);
 			collect_data_flag = false;
-			gpio_pin_set(leddev, PIN, false);
+			gpio_pin_set(ledred, PIN, false);
 		}
 			
 	}

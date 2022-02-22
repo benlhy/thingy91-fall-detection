@@ -41,7 +41,8 @@ I collected three different sets of movement for testing:
 2. Resting
 3. Falls
 
-For this step I attached the Thingy:91 to myself by dangling the Thingy:91 from a lanyard with a hand-tied knot through the useful lightwell on the Thingy:91. From there, I used the multifunction button to trigger a timed recording of my movement, which would be captured on the nRF Connect App on my smartphone, logged, processed and then fed into Edge Impulse's data ingestion service.
+
+For this step I attached the Thingy:91 to myself by dangling the Thingy:91 from a lanyard with a hand-tied knot through the useful lightwell on the Thingy:91. From there, I used the multifunction button to trigger a timed recording of my movement, which would be captured on the nRF Connect App on my smartphone, logged, processed and then fed into Edge Impulse's data ingestion service. 
 
 From there, it was just a matter of tweaking the parameters to get a good model of what I wanted. I think this really speaks to the ease of use of Edge Impulse, because it provides a very fuss-free way to incoroporate machine learning elements into an embedded system. While I have explored Machine Learning before and understand some of the concepts, I definitely would have taken way longer to recreate what I can do in a few clicks in Edge Impulse. The great thing about Edge Impulse is that it also isn't shy about showing you all the details of your model, and if you really want to, you can look at the IPython notebook that is generating your model for further tweaking and optimization. Luckily, I never really had to do this because the defaults are good enough, but it was very illuminating to lift the veil as it were, and check out the code from time to time to learn a little but more.
 

@@ -13,7 +13,7 @@
 #include <drivers/sensor.h>
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 #include "edge-impulse-sdk/dsp/numpy.hpp"
-
+#include <algorithm>
 
 
 /* The devicetree node identifier for the nodelabel in the dts file. */
@@ -29,6 +29,7 @@ static struct gpio_callback button_cb_data;
 
 
 /* The devicetree node identifier for the nodelabel in the dts file. */
+// RED
 #define LED0_NODE DT_ALIAS(led0)
 
 #if DT_NODE_HAS_STATUS(LED0_NODE, okay)
@@ -44,12 +45,13 @@ static struct gpio_callback button_cb_data;
 #endif
 
 /* The devicetree node identifier for the nodelabel in the dts file. */
+// GREEN
 #define LED1_NODE DT_ALIAS(led1)
 
 #if DT_NODE_HAS_STATUS(LED1_NODE, okay)
-#define LED0	DT_GPIO_LABEL(LED1_NODE, gpios)
-#define PIN		DT_GPIO_PIN(LED1_NODE, gpios)
-#define FLAGS	DT_GPIO_FLAGS(LED1_NODE, gpios)
+#define LED1	DT_GPIO_LABEL(LED1_NODE, gpios)
+#define PIN1	DT_GPIO_PIN(LED1_NODE, gpios)
+#define FLAGS1	DT_GPIO_FLAGS(LED1_NODE, gpios)
 #else
 /* A build error here means your board isn't set up to blink an LED. */
 #error "Unsupported board: led0 devicetree alias is not defined"
@@ -61,11 +63,20 @@ static struct gpio_callback button_cb_data;
 #define TIMER_INTERVAL_MSEC 60
 #define TOTAL_DATA_POINTS 3000
 
+#define PRINT_ACCEL_DATA false
+#define ANOMALY_LIMIT 1.4
+
+
+
 K_SEM_DEFINE(sem, 0, 1);
 
 struct k_timer data_sampling_timer;
 
-bool collect_data_flag;
+/*
+	Controls start and stop of the data sampling timer
+*/
+
+bool collect_data_flag; 
 int count;
 
 const struct device *dev;
@@ -74,11 +85,14 @@ struct sensor_value accel[3];
 const struct device *ledred;
 const struct device *ledgreen;
 
-static const float features[] = {
-    // copy raw features here (for example from the 'Live classification' page)
-    // see https://docs.edgeimpulse.com/docs/running-your-impulse-zephyr
-	1,3,4,5,6,7,8
-};
+
+/*
+	Features are determined by x,y,z,v,x,y,z,v...
+*/
+int features_index = 0; // used to keep track of the first fill of the data buffer
+int sample_counter = 0; // counter to indicate when a new frame is ready
+
+static float features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
 
 /*
 	Sample the IMU
@@ -103,12 +117,67 @@ static int imu_sample(void) {
 		return 1;
 	}
 
-	printf("x: %.1f, y: %.1f, z: %.1f (m/s^2)\n",
-		sensor_value_to_double(&accel[0]),
-		sensor_value_to_double(&accel[1]),
-		sensor_value_to_double(&accel[2]));
-		count++;
-		gpio_pin_set(ledred, PIN, true);
+	float x = sensor_value_to_double(&accel[0]);
+	float y = sensor_value_to_double(&accel[1]);
+	float z = sensor_value_to_double(&accel[2]);
+
+	float v = sqrt(pow(x,2.0)+pow(y,2.0)+pow(z,2.0));
+
+	if (PRINT_ACCEL_DATA) {
+			printf("x: %.1f, y: %.1f, z: %.1f, v: %.1f (m/s^2)\n",
+		x,
+		y,
+		z,
+		v);
+
+	}
+
+
+	
+	// implement a queue like feature
+	if (features_index==EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+
+		// insert into first element
+		features[0] = x;
+		features[1] = y;
+		features[2] = z;
+		features[3] = v;
+
+		// utilize cpp rotate
+		std::rotate(&features[0],&features[4],&features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE]);
+
+
+
+		// shift all elements in the array to the right by 4 (removing one sample)
+		/*
+		for(int i=0;i<last_set;++i) {
+			features[i*4] =	features[i*4+4];
+			features[i*4+1] =  features[i*4+5];
+			features[i*4+2] =  features[i*4+6];
+			features[i*4+3] =  features[i*4+7];
+		}
+		*/
+
+
+	} else {
+
+		// fill up the features buffer
+		features[features_index] = x;
+		features[features_index+1] = y;
+		features[features_index+2] = z;
+		features[features_index+3] = v;
+		features_index = features_index+4;
+	}
+
+	// the sample counter will keep track of each new sample set
+
+	if (sample_counter==EI_CLASSIFIER_RAW_SAMPLE_COUNT) {
+		sample_counter = 0;
+	} else {
+		sample_counter = sample_counter + 1;
+	}
+
+	count++;
 
 	
 	return 0;
@@ -129,12 +198,20 @@ void imu_sample_event(struct k_timer *timer_id){
 void button_pressed(const struct device *dev, struct gpio_callback *cb,
 		    uint32_t pins)
 {
-	collect_data_flag = true;	// set flag to collect data
-	count = 0; 					// reset count
+	// use button as toggle
+	if (collect_data_flag) {
+		// stop collecting data
+		collect_data_flag = false;
+		k_timer_stop(&data_sampling_timer);
+		gpio_pin_set(ledred, PIN, false);
 
-	// start timer for data sampling
-	k_timer_start(&data_sampling_timer, K_MSEC(TIMER_INTERVAL_MSEC), K_MSEC(TIMER_INTERVAL_MSEC));
+	} else {
+		collect_data_flag = true;	// set flag to collect data
+		gpio_pin_set(ledred, PIN, true);
+		// start timer for data sampling
+		k_timer_start(&data_sampling_timer, K_MSEC(TIMER_INTERVAL_MSEC), K_MSEC(TIMER_INTERVAL_MSEC));
 
+	}
 	// printk("Button pressed at %" PRIu32 "\n", k_cycle_get_32());
 
 }
@@ -171,7 +248,7 @@ int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
 
 void main(void)
 {
-	// start a timer to sample the imu at a set interval
+	// set up a timer to sample the imu at a set interval
 	k_timer_init(&data_sampling_timer, imu_sample_event, NULL);
 	
 
@@ -189,20 +266,20 @@ void main(void)
 	if (ret<0 ){
 		return;
 	}
-	// gpio_pin_set(ledred, PIN, true);
+	gpio_pin_set(ledred, PIN, false);
 
-	ledgreen = device_get_binding(LED0);
+	ledgreen = device_get_binding(LED1);
 	if (ledgreen==NULL) {
 		printk("No device found!");
 		return;
 	}
-	ret = gpio_pin_configure(ledgreen,PIN, GPIO_OUTPUT_ACTIVE | FLAGS);
+	ret = gpio_pin_configure(ledgreen,PIN1, GPIO_OUTPUT_ACTIVE | FLAGS1);
 
 	if (ret<0 ){
 		return;
 	}
 
-	gpio_pin_set(ledgreen, PIN, true);
+	gpio_pin_set(ledgreen, PIN1, true);
 
 
 	
@@ -264,12 +341,10 @@ void main(void)
 		}
 	}
 
-	gpio_pin_set(ledgreen, PIN, false);	// setup complete
+	gpio_pin_set(ledgreen, PIN1, false);	// setup complete
 	
 	// setup impulse result
 	ei_impulse_result_t result = { 0 };
-
-	
 
 	
 	k_sleep(K_MSEC(1000));
@@ -279,14 +354,16 @@ void main(void)
 	while (true) {
 
 		// the features are stored into flash, and we don't want to load everything into RAM
-		if (sizeof(features) / sizeof(float) == EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+		if (sample_counter==EI_CLASSIFIER_RAW_SAMPLE_COUNT) {
+			// new frame is ready
 			printk("Features array full, starting computation.\n");
+
 			signal_t features_signal;
 			features_signal.total_length = sizeof(features) / sizeof(features[0]);
 			features_signal.get_data = &raw_feature_get_data;
 
-			// invoke the impulse
-			EI_IMPULSE_ERROR res = run_classifier(&features_signal, &result, true);
+			// invoke the impulse, turn off the debug
+			EI_IMPULSE_ERROR res = run_classifier(&features_signal, &result, false);
 			printk("run_classifier returned: %d\n", res);
 
 			if (res != 0) printk("Error detected!");
@@ -308,13 +385,23 @@ void main(void)
 					}
 			#if EI_CLASSIFIER_HAS_ANOMALY == 1
 					ei_printf_float(result.anomaly);
+					if(result.anomaly>ANOMALY_LIMIT) {
+						gpio_pin_set(ledgreen, PIN1, true);
+					} else {
+						gpio_pin_set(ledgreen, PIN1, false);
+					}
 			#endif
 					printk("]\n");
 			
+			// not necessary to reset the buffer because it is a queue with a counter to keep track when the next sample set is ready
+			
 		} else {
-			printk("Progress: %u/%d\n",
-				sizeof(features) / sizeof(float),EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
+			if (collect_data_flag) {
+				printk("Progress: %u/%d\n",
+				sample_counter,EI_CLASSIFIER_RAW_SAMPLE_COUNT);
 			// continue to collect data
+			}
+			
 		}
 
 
@@ -331,7 +418,9 @@ void main(void)
 			}	
 		}
 
-		// if the collect_data_flag has been set and 
+		/*
+
+		// if the collect_data_flag has been set 
 
 		if (collect_data_flag && count < TOTAL_DATA_POINTS ) {
 			// continue to collect data
@@ -343,6 +432,7 @@ void main(void)
 			collect_data_flag = false;
 			gpio_pin_set(ledred, PIN, false);
 		}
+		*/
 			
 	}
 }

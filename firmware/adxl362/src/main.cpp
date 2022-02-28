@@ -4,16 +4,31 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+
+//#define LTE_ON // turn on LTE for the device
+
+
 #include <zephyr.h>
 #include <sys/printk.h>
 #include <devicetree.h>
 #include <drivers/gpio.h>
-//#include <stdio.h>
+
 #include <device.h>
 #include <drivers/sensor.h>
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 #include "edge-impulse-sdk/dsp/numpy.hpp"
 #include <algorithm>
+
+#ifdef LTE_ON
+#include <string.h>
+#include <stdlib.h>
+#include <net/socket.h>
+#include <modem/nrf_modem_lib.h>
+#include <net/tls_credentials.h>
+#include <modem/lte_lc.h>
+#include <modem/modem_key_mgmt.h>
+#include <stdio.h>
+#endif
 
 
 /* The devicetree node identifier for the nodelabel in the dts file. */
@@ -69,13 +84,13 @@ static struct gpio_callback button_cb_data;
 
 
 K_SEM_DEFINE(sem, 0, 1);
+K_SEM_DEFINE(data_ready,0,1);
 
 struct k_timer data_sampling_timer;
 
 /*
 	Controls start and stop of the data sampling timer
 */
-
 bool collect_data_flag; 
 int count;
 
@@ -93,6 +108,288 @@ int features_index = 0; // used to keep track of the first fill of the data buff
 int sample_counter = 0; // counter to indicate when a new frame is ready
 
 static float features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+
+
+/*
+	This timer starts the countdown to cancel 
+*/
+struct k_timer alert_countdown_timer;
+
+// User has 15 seconds to cancel message
+// shortened to 1.5 sec for testing
+#define COUNTDOWN_INTERVAL_MSEC 1500
+
+#define HTTPS_PORT 443
+
+#define HTTPS_HOSTNAME "proud-wind-646.super-hokio.workers.dev"
+
+#define HTTP_HEAD                                                              \
+	"HEAD / HTTP/1.1\r\n"                                                  	\
+	"Host: " HTTPS_HOSTNAME "\r\n"                                     	\
+	"Accept: */*\r\n"														\
+	"Connection: close\r\n\r\n"													
+
+
+
+#define HTTP_HEAD_LEN (sizeof(HTTP_HEAD) - 1)
+
+#define HTTP_HDR_END "\r\n\r\n"
+
+#define RECV_BUF_SIZE 2048
+#define TLS_SEC_TAG 42
+
+//static const char send_buf[] = HTTP_HEAD;
+static char recv_buf[RECV_BUF_SIZE];
+
+// controls the sending of alerts
+bool send_alert=false;
+
+/* Set up variable buffer for sending messages */
+char send_buf[500];
+
+#define POST_TEMPLATE "POST / HTTP/1.1\r\n"\
+		"Host: " HTTPS_HOSTNAME "\r\n"\
+		"Connection: close\r\n"\
+		"Content-Type: application/json\r\n"\
+		"Content-length: %d\r\n\r\n"\
+		"%s"
+
+#define TEST_DATA "{\"type\":\"alert\"}\r\n\r\n"
+
+
+/* Certificate for the website */
+static const char cert[] = {
+	#include "../cert/ISRGRootX1CA.pem"
+};
+
+BUILD_ASSERT(sizeof(cert) < KB(4), "Certificate too large");
+
+
+#ifdef LTE_ON
+/* Provision certificate to modem */
+int cert_provision(void)
+{
+	int err;
+	bool exists;
+	int mismatch;
+
+	/* It may be sufficient for you application to check whether the correct
+	 * certificate is provisioned with a given tag directly using modem_key_mgmt_cmp().
+	 * Here, for the sake of the completeness, we check that a certificate exists
+	 * before comparing it with what we expect it to be.
+	 */
+	err = modem_key_mgmt_exists(TLS_SEC_TAG, MODEM_KEY_MGMT_CRED_TYPE_CA_CHAIN, &exists);
+	if (err) {
+		printk("Failed to check for certificates err %d\n", err);
+		return err;
+	}
+
+	if (exists) {
+		mismatch = modem_key_mgmt_cmp(TLS_SEC_TAG,
+					      MODEM_KEY_MGMT_CRED_TYPE_CA_CHAIN,
+					      cert, strlen(cert));
+		if (!mismatch) {
+			printk("Certificate match\n");
+			return 0;
+		}
+
+		printk("Certificate mismatch\n");
+		err = modem_key_mgmt_delete(TLS_SEC_TAG, MODEM_KEY_MGMT_CRED_TYPE_CA_CHAIN);
+		if (err) {
+			printk("Failed to delete existing certificate, err %d\n", err);
+		}
+	}
+
+	printk("Provisioning certificate\n");
+
+	/*  Provision certificate to the modem */
+	err = modem_key_mgmt_write(TLS_SEC_TAG,
+				   MODEM_KEY_MGMT_CRED_TYPE_CA_CHAIN,
+				   cert, sizeof(cert) - 1);
+	if (err) {
+		printk("Failed to provision certificate, err %d\n", err);
+		return err;
+	}
+
+	return 0;
+}
+
+/* Setup TLS options on a given socket */
+int tls_setup(int fd)
+{
+	int err;
+	int verify;
+
+	/* Security tag that we have provisioned the certificate with */
+	const sec_tag_t tls_sec_tag[] = {
+		TLS_SEC_TAG,
+	};
+
+#if defined(CONFIG_SAMPLE_TFM_MBEDTLS)
+	err = tls_credential_add(tls_sec_tag[0], TLS_CREDENTIAL_CA_CERTIFICATE, cert, sizeof(cert));
+	if (err) {
+		return err;
+	}
+#endif
+
+	/* Set up TLS peer verification */
+	enum {
+		NONE = 0,
+		OPTIONAL = 1,
+		REQUIRED = 2,
+	};
+
+	verify = REQUIRED;
+
+	err = setsockopt(fd, SOL_TLS, TLS_PEER_VERIFY, &verify, sizeof(verify));
+	if (err) {
+		printk("Failed to setup peer verification, err %d\n", errno);
+		return err;
+	}
+
+	/* Associate the socket with the security tag
+	 * we have provisioned the certificate with.
+	 */
+	err = setsockopt(fd, SOL_TLS, TLS_SEC_TAG_LIST, tls_sec_tag,
+			 sizeof(tls_sec_tag));
+	if (err) {
+		printk("Failed to setup TLS sec tag, err %d\n", errno);
+		return err;
+	}
+
+	err = setsockopt(fd, SOL_TLS, TLS_HOSTNAME, HTTPS_HOSTNAME, sizeof(HTTPS_HOSTNAME) - 1);
+	if (err) {
+		printk("Failed to setup TLS hostname, err %d\n", errno);
+		return err;
+	}
+	return 0;
+}
+
+/*
+	Setup an LTE connection
+*/
+
+void setup_connection() {
+		int err;
+	int fd;
+	char *p;
+	int bytes;
+	size_t off;
+	struct addrinfo *res;
+	struct addrinfo hints = {
+		.ai_family = AF_INET,
+		.ai_socktype = SOCK_STREAM,
+	};
+
+	int send_data_len;
+
+	send_data_len = snprintf(send_buf,500,POST_TEMPLATE,15,TEST_DATA);
+
+	printk("HTTPS client sample started\n\r");
+
+	
+
+#if !defined(CONFIG_SAMPLE_TFM_MBEDTLS)
+	/* Provision certificates before connecting to the LTE network */
+	err = cert_provision();
+	if (err) {
+		return;
+	}
+#endif
+
+	printk("Waiting for network.. ");
+	err = lte_lc_init_and_connect();
+	if (err) {
+		printk("Failed to connect to the LTE network, err %d\n", err);
+		return;
+	}
+	printk("OK\n");
+
+
+	err = getaddrinfo(HTTPS_HOSTNAME, NULL, &hints, &res);
+	if (err) {
+		printk("getaddrinfo() failed, err %d\n", errno);
+		return;
+	}
+
+	((struct sockaddr_in *)res->ai_addr)->sin_port = htons(HTTPS_PORT);
+
+	if (IS_ENABLED(CONFIG_SAMPLE_TFM_MBEDTLS)) {
+		fd = socket(AF_INET, SOCK_STREAM | SOCK_NATIVE_TLS, IPPROTO_TLS_1_2);
+	} else {
+		fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TLS_1_2);
+	}
+	if (fd == -1) {
+		printk("Failed to open socket!\n");
+		goto clean_up;
+	}
+
+	/* Setup TLS socket options */
+	err = tls_setup(fd);
+	if (err) {
+		goto clean_up;
+	}
+	
+
+}
+
+/*
+	Send an alert to a waiting endpoint
+*/
+
+void send_alert() {
+	printk("Connecting to %s\n", HTTPS_HOSTNAME);
+	err = connect(fd, res->ai_addr, sizeof(struct sockaddr_in));
+	if (err) {
+		printk("connect() failed, err: %d\n", errno);
+		goto clean_up;
+	}
+		off = 0;
+
+	do {
+		bytes = send(fd, &send_buf[off],send_data_len - off, 0);
+		if (bytes < 0) {
+			printk("send() failed, err %d\n", errno);
+			goto clean_up;
+		}
+		off += bytes;
+	} while (off < send_data_len );
+
+	printk("Sent %d bytes\n", off);
+
+	off = 0;
+	do {
+		bytes = recv(fd, &recv_buf[off], RECV_BUF_SIZE - off, 0);
+		if (bytes < 0) {
+			printk("recv() failed, err %d\n", errno);
+			goto clean_up;
+		}
+		off += bytes;
+	} while (bytes != 0 /* peer closed connection */);
+
+	printk("%s\r\n",recv_buf);
+
+	printk("Received %d bytes\n", off);
+
+	/* Print HTTP response */
+	p = strstr(recv_buf, "\r\n");
+	if (p) {
+		off = p - recv_buf;
+		recv_buf[off + 1] = '\0';
+		printk("\n>\t %s\n\n", recv_buf);
+	}
+
+	printk("Finished, closing socket.\n");
+
+clean_up:
+	freeaddrinfo(res);
+	(void)close(fd);
+
+	lte_lc_power_off();
+}
+
+
+#endif
 
 /*
 	Sample the IMU
@@ -129,7 +426,6 @@ static int imu_sample(void) {
 		y,
 		z,
 		v);
-
 	}
 
 
@@ -137,7 +433,7 @@ static int imu_sample(void) {
 	// implement a queue like feature
 	if (features_index==EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
 
-		// insert into first element
+		// insert into first set
 		features[0] = x;
 		features[1] = y;
 		features[2] = z;
@@ -183,6 +479,24 @@ static int imu_sample(void) {
 	return 0;
 
 }
+void send_alert_event(struct k_timer *timer_id){
+	#ifdef LTE_ON
+    int err = send_alert();
+    if (err) {
+        printk("Error in alert sending: %d\n", err);
+    }
+	#endif
+	// flash to indicate that the message has been sent
+	printk("Alert sent!\r\n");
+	for (auto i=0; i<5; ++i) {
+		gpio_pin_set(ledgreen, PIN1, true);
+		k_sleep(K_MSEC(500));
+		gpio_pin_set(ledgreen, PIN1, false);
+		k_sleep(K_MSEC(500));
+	}
+	send_alert = false; // alert has been sent
+}
+
 
 void imu_sample_event(struct k_timer *timer_id){
     int err = imu_sample();
@@ -209,12 +523,21 @@ void button_pressed(const struct device *dev, struct gpio_callback *cb,
 		collect_data_flag = true;	// set flag to collect data
 		gpio_pin_set(ledred, PIN, true);
 		// start timer for data sampling
-		k_timer_start(&data_sampling_timer, K_MSEC(TIMER_INTERVAL_MSEC), K_MSEC(TIMER_INTERVAL_MSEC));
+		k_timer_start(&data_sampling_timer, K_MSEC(TIMER_INTERVAL_MSEC), K_FOREVER);
 
+	} 
+
+	if (send_alert) {
+		printk("Alert cancelled");
+		// cancel the alert
+		send_alert = false;
+		k_timer_stop(&alert_countdown_timer);
+		gpio_pin_set(ledgreen, PIN1, false);
 	}
 	// printk("Button pressed at %" PRIu32 "\n", k_cycle_get_32());
 
 }
+
 
 
 
@@ -250,6 +573,8 @@ void main(void)
 {
 	// set up a timer to sample the imu at a set interval
 	k_timer_init(&data_sampling_timer, imu_sample_event, NULL);
+	// set up a timer to alert the lte
+	k_timer_init(&alert_countdown_timer, send_alert_event, NULL);
 	
 
 	// set up LED
@@ -385,10 +710,34 @@ void main(void)
 					}
 			#if EI_CLASSIFIER_HAS_ANOMALY == 1
 					ei_printf_float(result.anomaly);
+					printk("%f",result.anomaly);
+					
 					if(result.anomaly>ANOMALY_LIMIT) {
+						printk("Over Anomaly limit");
 						gpio_pin_set(ledgreen, PIN1, true);
+						send_alert = true;
+
+						// wait for cancellation
+						// send data to cloud
+						#ifdef LTE_ON
+						// only set it up here if 
+						setup_lte_connection();
+
+						#endif
+						// set up a timer that will send out an alert if the button is not pressed
+						printk("Starting timer\r\n");
+						// start the one shot timer - cancel by pressing the multi-use button
+						k_timer_start(&alert_countdown_timer, K_MSEC(COUNTDOWN_INTERVAL_MSEC),K_MSEC(COUNTDOWN_INTERVAL_MSEC));
+
 					} else {
-						gpio_pin_set(ledgreen, PIN1, false);
+						printk("Ok\r\n");
+						/*
+						if(!send_alert) {
+							gpio_pin_set(ledgreen, PIN1, false);
+
+						}
+						*/
+						
 					}
 			#endif
 					printk("]\n");
@@ -397,9 +746,8 @@ void main(void)
 			
 		} else {
 			if (collect_data_flag) {
-				printk("Progress: %u/%d\n",
-				sample_counter,EI_CLASSIFIER_RAW_SAMPLE_COUNT);
-			// continue to collect data
+				//printk("Progress: %u/%d\n",sample_counter,EI_CLASSIFIER_RAW_SAMPLE_COUNT);
+			    // continue to collect data
 			}
 			
 		}
